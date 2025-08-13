@@ -1,5 +1,5 @@
--- 兼容当前数据库结构的订阅清理函数
--- 不包含credit_type字段，使用现有的transaction_type约束
+-- 修复版本的订阅清理函数
+-- 使用允许的transaction_type值
 
 -- 1. 立即清理过期订阅积分的函数
 CREATE OR REPLACE FUNCTION immediate_subscription_cleanup()
@@ -31,7 +31,7 @@ BEGIN
     
     v_result := '清理完成于 ' || CURRENT_TIMESTAMP || '. 共清理 ' || v_cleaned_count || ' 个用户. ' || v_result;
     
-    -- 记录清理操作（使用现有的字段结构）
+    -- 记录清理操作（使用允许的transaction_type）
     INSERT INTO act_credit_transactions (
         user_id,
         transaction_type,
@@ -156,3 +156,5 @@ ORDER BY subscription_end_date ASC;
 -- 测试函数
 SELECT '清理函数创建完成' as status;
 SELECT check_subscription_cleanup_status();
+
+

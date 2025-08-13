@@ -56,3 +56,5 @@ SELECT
     SUM(recharge_credits) as total_recharge_credits,
     SUM(credits_balance) as total_credits_balance
 FROM act_users;
+
+

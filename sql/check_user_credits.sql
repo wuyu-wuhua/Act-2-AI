@@ -48,3 +48,5 @@ WHERE user_id = (
 )
 GROUP BY transaction_type
 ORDER BY total_amount DESC;
+
+

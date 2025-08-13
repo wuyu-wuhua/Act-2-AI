@@ -3,7 +3,7 @@ import Stripe from 'stripe';
 // 服务器端 Stripe 实例
 export const stripe = typeof window === 'undefined' 
   ? new Stripe(process.env.STRIPE_SECRET_KEY!, {
-      apiVersion: '2024-12-18.acacia',
+      apiVersion: '2025-07-30.basil',
     })
   : null;
 

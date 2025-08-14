@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { supabase } from "@/lib/supabase"
 import { Navigation } from "@/components/navigation"
 import { Button } from "@/components/ui/button"
@@ -32,6 +32,7 @@ export default function ProfilePage() {
   const [lang, setLang] = useState<"zh" | "en">("en")
   const [user, setUser] = useState<User | null>(null)
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [activeTab, setActiveTab] = useState<'overview'>('overview')
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [creditStats, setCreditStats] = useState<CreditStats>({
@@ -88,7 +89,7 @@ export default function ProfilePage() {
 
       if (success && creditsAdded) {
         alert(`订阅成功！已为您添加 ${creditsAdded} 积分。`)
-        // 重新加载用户数据以显示最新积分
+        // 立即重新加载用户数据以显示最新积分
         if (user) {
           loadUserData(user.id)
         }
@@ -102,30 +103,45 @@ export default function ProfilePage() {
     }
   }, [user])
 
-  const loadUserData = async (userId: string) => {
+  // 优化后的数据加载函数
+  const loadUserData = useCallback(async (userId: string) => {
     try {
       console.log('🔍 开始加载用户数据...', userId)
       
-      // 首先确保用户在数据库中存在
-      const { data: { user } } = await supabase.auth.getUser()
-      if (!user) {
-        console.log('❌ 用户未登录')
-        return
-      }
+      // 并行加载数据以提高速度
+      const [userResult, transactionsResult, purchasesResult] = await Promise.all([
+        // 获取用户基本信息
+        supabase
+          .from('act_users')
+          .select('id, email, google_id, google_full_name, google_avatar, credits_balance, subscription_credits, recharge_credits, subscription_status, subscription_end_date')
+          .eq('id', userId)
+          .single(),
+        
+        // 获取积分交易记录
+        supabase
+          .from('act_credit_transactions')
+          .select('*')
+          .eq('user_id', userId),
+        
+        // 获取积分购买记录
+        supabase
+          .from('act_credit_purchases')
+          .select('*')
+          .eq('user_id', userId)
+      ])
 
-      // 检查用户是否已在数据库中存在
-      const { data: existingUser, error: checkError } = await supabase
-        .from('act_users')
-        .select('id, credits_balance')
-        .eq('id', userId)
-        .single()
-
-      let isNewUser = false
-
-      if (checkError && checkError.code === 'PGRST116') {
+      // 检查用户是否存在
+      if (userResult.error && userResult.error.code === 'PGRST116') {
         console.log('⚠️ 用户不存在于数据库中，创建新用户...')
         
-        // 用户不存在，创建新用户记录
+        // 获取当前认证用户
+        const { data: { user } } = await supabase.auth.getUser()
+        if (!user) {
+          console.log('❌ 用户未登录')
+          return
+        }
+        
+        // 创建新用户记录
         const { error: insertError } = await supabase
           .from('act_users')
           .insert({
@@ -134,7 +150,9 @@ export default function ProfilePage() {
             google_id: user.user_metadata?.sub,
             google_full_name: user.user_metadata?.full_name,
             google_avatar: user.user_metadata?.avatar_url,
-            credits_balance: 0
+            credits_balance: 50, // 直接设置50积分
+            subscription_credits: 0,
+            recharge_credits: 50
           })
 
         if (insertError) {
@@ -142,21 +160,8 @@ export default function ProfilePage() {
           return
         }
         
-        console.log('✅ 新用户创建成功！')
-        isNewUser = true
-      } else if (checkError) {
-        console.error('❌ 检查用户失败:', checkError)
-        return
-      } else {
-        console.log('✅ 用户已存在于数据库中，当前积分:', existingUser?.credits_balance || 0)
-      }
-
-      // 如果是新用户，直接送50积分
-      if (isNewUser) {
-        console.log('🎁 新用户，直接送50积分...')
-        
         // 创建积分交易记录
-        const { error: transError } = await supabase
+        await supabase
           .from('act_credit_transactions')
           .insert({
             user_id: userId,
@@ -167,165 +172,64 @@ export default function ProfilePage() {
             description: '新用户注册奖励',
             reference_id: 'signup_bonus'
           })
-
-        if (transError) {
-          console.error('❌ 创建积分交易记录失败:', transError)
-          return
-        }
-
-        // 更新用户积分余额
-        const { error: updateError } = await supabase
-          .from('act_users')
-          .update({ credits_balance: 50 })
-          .eq('id', userId)
-
-        if (updateError) {
-          console.error('❌ 更新用户积分失败:', updateError)
-          return
-        }
-
-        console.log('🎉 新用户50积分赠送成功！')
-      } else {
-        // 对于老用户，检查是否需要送积分
-        console.log('🔍 检查老用户是否需要送积分...')
         
-        // 获取用户交易记录
-        const { data: transactions, error: transError } = await supabase
-          .from('act_credit_transactions')
-          .select('id')
-          .eq('user_id', userId)
-
-        if (transError) {
-          console.error('❌ 获取交易记录失败:', transError)
-          return
-        }
-
-        const currentCredits = existingUser?.credits_balance || 0
-        const hasTransactions = transactions && transactions.length > 0
-
-        console.log('📊 用户状态:', {
-          currentCredits,
-          hasTransactions: hasTransactions,
-          transactionCount: transactions?.length || 0
-        })
-
-        // 判断是否应该送积分：没有交易记录且积分为0
-        if (!hasTransactions && currentCredits === 0) {
-          console.log('🎁 老用户但无交易记录且积分为0，送50积分...')
-          
-          // 创建积分交易记录
-          const { error: bonusTransError } = await supabase
-            .from('act_credit_transactions')
-            .insert({
-              user_id: userId,
-              transaction_type: 'bonus',
-              credits_amount: 50,
-              balance_before: 0,
-              balance_after: 50,
-              description: '新用户注册奖励',
-              reference_id: 'signup_bonus'
-            })
-
-          if (bonusTransError) {
-            console.error('❌ 创建积分交易记录失败:', bonusTransError)
-            return
-          }
-
-          // 更新用户积分余额
-          const { error: bonusUpdateError } = await supabase
-            .from('act_users')
-            .update({ credits_balance: 50 })
-            .eq('id', userId)
-
-          if (bonusUpdateError) {
-            console.error('❌ 更新用户积分失败:', bonusUpdateError)
-            return
-          }
-
-          console.log('🎉 老用户50积分赠送成功！')
-        } else {
-          console.log('ℹ️ 用户已有交易记录或积分，无需赠送')
-        }
-      }
-
-      // 获取最新的用户数据
-      const { data: finalUser, error: finalError } = await supabase
-        .from('act_users')
-        .select('subscription_credits, recharge_credits, credits_balance, subscription_status, subscription_end_date')
-        .eq('id', userId)
-        .single()
-
-      if (finalError) {
-        console.error('❌ 获取最终用户数据失败:', finalError)
+        console.log('✅ 新用户创建成功！')
+      } else if (userResult.error) {
+        console.error('❌ 获取用户数据失败:', userResult.error)
         return
       }
 
-      // 获取积分交易记录（从两个表合并）
-      const { data: transactions1, error: transError1 } = await supabase
-        .from('act_credit_transactions')
-        .select('*')
-        .eq('user_id', userId)
-
-      const { data: transactions2, error: transError2 } = await supabase
-        .from('act_credit_purchases')
-        .select('*')
-        .eq('user_id', userId)
-
-      if (transError1 || transError2) {
-        console.error('❌ 获取交易记录失败:', transError1 || transError2)
+      // 获取最终用户数据
+      const finalUser = userResult.data || userResult.data
+      if (!finalUser) {
+        console.error('❌ 无法获取用户数据')
         return
       }
 
-      // 合并两个表的交易记录
+      // 处理交易记录
+      const transactions = transactionsResult.data || []
+      const purchases = purchasesResult.data || []
+      
+      // 合并并排序交易记录
       const allTransactions = [
-        ...(transactions1 || []).map(t => ({ ...t, source: 'transactions' })),
-        ...(transactions2 || []).map(t => ({ ...t, source: 'purchases' }))
+        ...transactions.map(t => ({ ...t, source: 'transactions' })),
+        ...purchases.map(t => ({ ...t, source: 'purchases' }))
       ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
       .slice(0, 10)
 
-      // 计算积分统计（从两个表合并）
-      const { data: allTrans1, error: allTransError1 } = await supabase
-        .from('act_credit_transactions')
-        .select('transaction_type, credits_amount')
-        .eq('user_id', userId)
-
-      const { data: allTrans2, error: allTransError2 } = await supabase
-        .from('act_credit_purchases')
-        .select('transaction_type, credits_amount')
-        .eq('user_id', userId)
-
+      // 快速计算积分统计
       let totalEarned = 0
       let totalSpent = 0
 
-      // 处理第一个表的交易记录
-      if (!allTransError1 && allTrans1) {
-        allTrans1.forEach(trans => {
-          if (trans.transaction_type === 'purchase' || trans.transaction_type === 'bonus' || trans.transaction_type === 'subscription_purchase' || trans.transaction_type === 'subscription_renewal') {
-            totalEarned += trans.credits_amount
-          } else if (trans.transaction_type === 'consumption' || trans.transaction_type === 'subscription_expiry') {
-            totalSpent += Math.abs(trans.credits_amount)
-          }
-        })
-      }
+      // 并行处理两个表的统计
+      const [earned1, spent1] = transactions.reduce((acc, trans) => {
+        if (['purchase', 'bonus', 'subscription_purchase', 'subscription_renewal'].includes(trans.transaction_type)) {
+          acc[0] += trans.credits_amount
+        } else if (['consumption', 'subscription_expiry'].includes(trans.transaction_type)) {
+          acc[1] += Math.abs(trans.credits_amount)
+        }
+        return acc
+      }, [0, 0])
 
-      // 处理第二个表的交易记录
-      if (!allTransError2 && allTrans2) {
-        allTrans2.forEach(trans => {
-          if (trans.transaction_type === 'purchase' || trans.transaction_type === 'bonus' || trans.transaction_type === 'subscription' || trans.transaction_type === 'subscription_renewal') {
-            totalEarned += trans.credits_amount
-          } else if (trans.transaction_type === 'consumption' || trans.transaction_type === 'subscription_expiry') {
-            totalSpent += Math.abs(trans.credits_amount)
-          }
-        })
-      }
+      const [earned2, spent2] = purchases.reduce((acc, trans) => {
+        if (['purchase', 'bonus', 'subscription', 'subscription_renewal'].includes(trans.transaction_type)) {
+          acc[0] += trans.credits_amount
+        } else if (['consumption', 'subscription_expiry'].includes(trans.transaction_type)) {
+          acc[1] += Math.abs(trans.credits_amount)
+        }
+        return acc
+      }, [0, 0])
+
+      totalEarned = earned1 + earned2
+      totalSpent = spent1 + spent2
 
       // 计算距离过期天数
-      let daysUntilExpiry: number | undefined;
+      let daysUntilExpiry: number | undefined
       if (finalUser.subscription_end_date && finalUser.subscription_status === 'cancelled') {
-        const endDate = new Date(finalUser.subscription_end_date);
-        const now = new Date();
-        const diffTime = endDate.getTime() - now.getTime();
-        daysUntilExpiry = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        const endDate = new Date(finalUser.subscription_end_date)
+        const now = new Date()
+        const diffTime = endDate.getTime() - now.getTime()
+        daysUntilExpiry = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
       }
 
       // 更新积分统计
@@ -342,26 +246,23 @@ export default function ProfilePage() {
 
       // 转换交易记录格式
       const formattedTransactions: Transaction[] = allTransactions.map((trans: any) => {
-        // 特殊处理订阅相关的交易类型
-        let displayDescription = trans.description;
-        let displayAmount = trans.credits_amount;
+        let displayDescription = trans.description
+        let displayAmount = trans.credits_amount
         
         if (trans.transaction_type === 'subscription_expiry') {
-          // 订阅周期结束，显示为消费类型
-          displayDescription = currentContent.subscriptionExpiry;
-          displayAmount = -Math.abs(trans.credits_amount);
+          displayDescription = currentContent.subscriptionExpiry
+          displayAmount = -Math.abs(trans.credits_amount)
         } else if (trans.transaction_type === 'subscription_renewal') {
-          // 订阅续费，显示为充值类型
-          displayDescription = currentContent.subscriptionRenewal;
-          displayAmount = Math.abs(trans.credits_amount);
+          displayDescription = currentContent.subscriptionRenewal
+          displayAmount = Math.abs(trans.credits_amount)
         }
         
         return {
           id: trans.id.toString(),
-          type: (trans.transaction_type === 'purchase' || trans.transaction_type === 'bonus' || trans.transaction_type === 'subscription' || trans.transaction_type === 'subscription_purchase' || trans.transaction_type === 'subscription_renewal') ? 'recharge' : 'consumption',
+          type: (['purchase', 'bonus', 'subscription', 'subscription_purchase', 'subscription_renewal'].includes(trans.transaction_type)) ? 'recharge' : 'consumption',
           amount: displayAmount,
           description: displayDescription,
-          transaction_type: trans.transaction_type, // 添加原始交易类型
+          transaction_type: trans.transaction_type,
           created_at: new Date(trans.created_at).toLocaleString('zh-CN', {
             year: 'numeric',
             month: '2-digit',
@@ -369,7 +270,7 @@ export default function ProfilePage() {
             hour: '2-digit',
             minute: '2-digit'
           }).replace(/\//g, '/')
-        };
+        }
       })
 
       setTransactions(formattedTransactions)
@@ -378,7 +279,206 @@ export default function ProfilePage() {
     } catch (error) {
       console.error('❌ 加载用户数据时出现错误:', error)
     }
-  }
+  }, [])
+
+  // 手动刷新数据
+  const handleRefresh = useCallback(async () => {
+    if (!user || refreshing) return
+    
+    setRefreshing(true)
+    console.log('🔄 手动刷新数据...')
+    
+    try {
+      await loadUserData(user.id)
+      console.log('✅ 手动刷新完成')
+    } catch (error) {
+      console.error('❌ 手动刷新失败:', error)
+    } finally {
+      // 确保刷新状态被重置
+      setRefreshing(false)
+    }
+  }, [user, loadUserData, refreshing])
+  
+  // 强制检查订阅状态和积分
+  const handleForceCheck = useCallback(async () => {
+    if (!user || refreshing) return
+    
+    setRefreshing(true);
+    console.log('⚡ 强制检查订阅状态...');
+    
+    try {
+      const response = await fetch('/api/subscription/force-check', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ userId: user.id })
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        console.log('✅ 强制检查完成:', result);
+        
+        if (result.actionTaken && result.actionTaken !== '无需操作') {
+          alert(`订阅状态已更新：${result.actionTaken}`);
+        }
+        
+        // 重新加载数据
+        await loadUserData(user.id);
+      } else {
+        console.error('强制检查失败:', result.error);
+        alert('检查失败：' + result.error);
+      }
+    } catch (error) {
+      console.error('❌ 强制检查异常:', error);
+      alert('检查过程中出现错误');
+    } finally {
+      setRefreshing(false);
+    }
+  }, [user, refreshing, loadUserData]);
+
+  // 检查订阅到期状态
+  const handleCheckExpiry = useCallback(async () => {
+    if (!user || refreshing) return
+    
+    setRefreshing(true);
+    console.log('🔍 检查订阅到期状态...');
+    
+    try {
+      const response = await fetch('/api/subscription/check-expired', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ userId: user.id })
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        console.log('✅ 订阅到期检查完成:', result);
+        
+        if (result.needsCleanup) {
+          const shouldClear = confirm(
+            `检测到您的订阅已取消且周期结束，订阅积分 ${result.subscriptionCredits} 将被清零，充值积分 ${result.rechargeCredits} 将保留。\n\n是否现在执行积分清零？`
+          );
+          
+          if (shouldClear) {
+            await handleClearExpiredCredits();
+          }
+        } else {
+          alert(`订阅状态：${result.actionTaken}`);
+        }
+        
+        // 重新加载数据
+        await loadUserData(user.id);
+      } else {
+        console.error('订阅到期检查失败:', result.error);
+        alert('检查失败：' + result.error);
+      }
+    } catch (error) {
+      console.error('❌ 订阅到期检查异常:', error);
+      alert('检查过程中出现错误');
+    } finally {
+      setRefreshing(false);
+    }
+  }, [user, refreshing, loadUserData]);
+
+  // 执行积分清零
+  const handleClearExpiredCredits = useCallback(async () => {
+    if (!user || refreshing) return
+    
+    setRefreshing(true);
+    console.log('🧹 执行积分清零...');
+    
+    try {
+      const response = await fetch('/api/subscription/check-expired', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ userId: user.id })
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        console.log('✅ 积分清零完成:', result);
+        alert(`积分清零完成！\n清零订阅积分：${result.clearedSubscriptionCredits}\n保留充值积分：${result.remainingRechargeCredits}\n新的积分余额：${result.newCreditsBalance}`);
+        
+        // 重新加载数据
+        await loadUserData(user.id);
+      } else {
+        console.error('积分清零失败:', result.error);
+        alert(`清零失败：${result.error}\n原因：${result.reason || '未知原因'}`);
+      }
+    } catch (error) {
+      console.error('❌ 积分清零异常:', error);
+      alert('清零过程中出现错误');
+    } finally {
+      setRefreshing(false);
+    }
+  }, [user, refreshing, loadUserData]);
+
+  // 设置实时数据监听
+  useEffect(() => {
+    if (!user) return
+
+    // 监听用户积分变化
+    const userSubscription = supabase
+      .channel('user_credits_changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'act_users',
+          filter: `id=eq.${user.id}`
+        },
+        async (payload) => {
+          console.log('🔔 检测到用户积分变化:', payload)
+          // 延迟1秒后刷新数据，避免频繁更新，并检查是否正在刷新
+          setTimeout(() => {
+            if (!refreshing) {
+              loadUserData(user.id)
+            }
+          }, 1000)
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'act_credit_transactions',
+          filter: `user_id=eq.${user.id}`
+        },
+        async (payload) => {
+          console.log('🔔 检测到积分交易变化:', payload)
+          // 延迟1秒后刷新数据，并检查是否正在刷新
+          setTimeout(() => {
+            if (!refreshing) {
+              loadUserData(user.id)
+            }
+          }, 1000)
+        }
+      )
+      .subscribe()
+
+    // 设置定时刷新（每60秒检查一次，减少频率）
+    const intervalId = setInterval(() => {
+      if (user && !refreshing) {
+        console.log('⏰ 定时刷新用户数据...')
+        loadUserData(user.id)
+      }
+    }, 60000)
+
+    return () => {
+      userSubscription.unsubscribe()
+      clearInterval(intervalId)
+    }
+  }, [user, refreshing, loadUserData])
 
   const handleLangChange = (newLang: "zh" | "en") => {
     setLang(newLang)
@@ -603,14 +703,53 @@ export default function ProfilePage() {
                 <h3 className="text-lg font-semibold text-gray-900">
                   {currentContent.creditOverview}
                 </h3>
-                <button 
-                  onClick={() => user && loadUserData(user.id)}
-                  className="p-2 text-gray-400 hover:text-gray-600 transition-colors"
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                </button>
+                <div className="flex items-center space-x-2">
+                  <button 
+                    onClick={handleRefresh}
+                    disabled={refreshing}
+                    className={`p-2 text-gray-400 hover:text-gray-600 transition-all duration-200 rounded-full ${
+                      refreshing 
+                        ? 'animate-spin text-blue-500' 
+                        : 'hover:bg-gray-100 hover:scale-110'
+                    }`}
+                    title={refreshing ? '刷新中...' : '刷新数据'}
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                  </button>
+                  
+                  {/* 显示强制检查按钮仅当订阅已取消时 */}
+                  {creditStats.subscriptionStatus === 'cancelled' && (
+                    <div className="flex items-center space-x-2">
+                      <button 
+                        onClick={handleCheckExpiry}
+                        disabled={refreshing}
+                        className={`px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded-full transition-all duration-200 ${
+                          refreshing 
+                            ? 'opacity-50 cursor-not-allowed' 
+                            : 'hover:scale-105 shadow-lg'
+                        }`}
+                        title="检查订阅到期状态"
+                      >
+                        检查到期
+                      </button>
+                      
+                      <button 
+                        onClick={handleForceCheck}
+                        disabled={refreshing}
+                        className={`px-3 py-1 text-sm bg-orange-500 hover:bg-orange-600 text-white rounded-full transition-all duration-200 ${
+                          refreshing 
+                            ? 'opacity-50 cursor-not-allowed' 
+                            : 'hover:scale-105 shadow-lg'
+                        }`}
+                        title="强制检查订阅状态和积分"
+                      >
+                        检查状态
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </CardHeader>
             
